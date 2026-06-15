@@ -1,14 +1,18 @@
 /**
  * @file NexusManager.cpp
- * @brief Implements the NexusManager singleton.
+ * @brief Implements the NexusManager singleton with thread-safe synchronization.
  */
 
 #include "NexusManager.h"
 #include "FileSystem.h"
 #include <algorithm>
 #include <iostream>
+#include <mutex> // ADDED FOR SYNCHRONIZATION
 
 namespace nexusdb {
+
+// Global mutex to ensure thread-safe table creation and deletion
+static std::mutex managerMutex;
 
 NexusManager& NexusManager::getInstance() {
     static NexusManager instance;
@@ -70,6 +74,10 @@ Table* NexusManager::findTable(const std::string& name) {
 bool NexusManager::createTable(const std::string& name,
                                const std::vector<Column>& schema,
                                std::string& errMsg) {
+    // --- SYNCHRONIZATION ADDED HERE ---
+    // Locks the thread to prevent data corruption during concurrent creation
+    std::lock_guard<std::mutex> lock(managerMutex); 
+
     if (findTable(name)) { errMsg = "Table '" + name + "' already exists."; return false; }
     if (schema.empty()) { errMsg = "Cannot create a table with no columns."; return false; }
 
@@ -82,6 +90,10 @@ bool NexusManager::createTable(const std::string& name,
 }
 
 bool NexusManager::dropTable(const std::string& name, std::string& errMsg) {
+    // --- SYNCHRONIZATION ADDED HERE ---
+    // Locks the thread to safely delete files without race conditions
+    std::lock_guard<std::mutex> lock(managerMutex);
+
     std::string lower = name;
     std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
 
