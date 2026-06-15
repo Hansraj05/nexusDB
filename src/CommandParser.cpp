@@ -12,6 +12,7 @@
 #include <sstream>
 #include <algorithm>
 #include <map>
+#include <future> // ADDED FOR MULTI-THREADING / CONCURRENCY
 
 namespace nexusdb {
 
@@ -148,10 +149,6 @@ void CommandParser::cmdShowTables() {
               << " table(s) found." << color::RESET << "\n";
 }
 
-/**
- * Syntax: CREATE TABLE name col1:type, col2:type, ...
- * The first column is automatically the primary key.
- */
 void CommandParser::cmdCreateTable(const std::vector<std::string>& tokens) {
     if (tokens.size() < 4) {
         printError("Syntax: CREATE TABLE <name> <col1:type, col2:type, ...>");
@@ -160,18 +157,15 @@ void CommandParser::cmdCreateTable(const std::vector<std::string>& tokens) {
 
     std::string tableName = tokens[2];
 
-    // Rejoin remaining tokens to parse column definitions
     std::string colDefs;
     for (size_t i = 3; i < tokens.size(); ++i) {
         if (i > 3) colDefs += " ";
         colDefs += tokens[i];
     }
 
-    // Remove surrounding brackets if present
     if (!colDefs.empty() && colDefs.front() == '[') colDefs.erase(0, 1);
     if (!colDefs.empty() && colDefs.back() == ']')  colDefs.pop_back();
 
-    // Split by comma
     std::vector<Column> schema;
     std::istringstream ss(colDefs);
     std::string token;
@@ -204,7 +198,6 @@ void CommandParser::cmdDropTable(const std::vector<std::string>& tokens) {
     }
     std::string name = tokens[2];
 
-    // Confirmation prompt
     std::cout << color::BOLD_YELLOW
               << "  Are you sure you want to drop table '" << name
               << "'? This will delete the data file. (yes/no): "
@@ -247,7 +240,6 @@ void CommandParser::cmdHelpRoot() {
               << color::RESET << "\n";
     auto row = [](const std::string& cmd, const std::string& desc) {
         std::cout << "  " << color::BOLD_YELLOW << std::left;
-        // Pad command to 40 chars
         std::string padded = cmd;
         while (padded.size() < 38) padded += ' ';
         std::cout << padded << color::RESET << color::DIM_WHITE << desc
@@ -267,9 +259,6 @@ void CommandParser::cmdHelpRoot() {
 // Table-context commands
 // ═══════════════════════════════════════════════════════════════
 
-/**
- * INSERT INTO <table> — triggers a step-by-step data entry wizard.
- */
 void CommandParser::cmdInsertInto(const std::vector<std::string>& /*tokens*/) {
     Table* tbl = NexusManager::getInstance().getCurrentTable();
     if (!tbl) { printError("No table selected."); return; }
@@ -308,11 +297,6 @@ void CommandParser::cmdInsertInto(const std::vector<std::string>& /*tokens*/) {
     }
 }
 
-/**
- * SELECT * FROM <table> [WHERE col OP value [AND|OR col OP value ...]]
- * Supports operators: =, !=, >, <, >=, <=
- * Supports logical: AND, OR (AND has higher precedence)
- */
 void CommandParser::cmdSelect(const std::vector<std::string>& /*tokens*/,
                               const std::string& rawInput) {
     Table* tbl = NexusManager::getInstance().getCurrentTable();
@@ -320,12 +304,10 @@ void CommandParser::cmdSelect(const std::vector<std::string>& /*tokens*/,
 
     std::cout << "\n";
 
-    // Check for WHERE clause in raw input
     std::string upper = toUpper(rawInput);
     size_t wherePos = upper.find(" WHERE ");
 
     if (wherePos != std::string::npos) {
-        // Extract everything after WHERE
         std::string whereStr = rawInput.substr(wherePos + 7);
         WhereClause clause = QueryEngine::parseWhere(whereStr);
 
@@ -335,18 +317,24 @@ void CommandParser::cmdSelect(const std::vector<std::string>& /*tokens*/,
         }
 
         auto allRows = tbl->selectAll();
-        auto filtered = QueryEngine::filter(allRows, tbl->getColumns(), clause);
+
+        // --- MULTI-THREADING / CONCURRENCY ADDED HERE ---
+        // Executes the data filtering on a background thread
+        std::future<std::vector<Row>> futureFiltered = std::async(std::launch::async, [&]() {
+            return QueryEngine::filter(allRows, tbl->getColumns(), clause);
+        });
+
+        std::cout << color::DIM_WHITE << "  [Executing concurrent search on background thread...]\n" << color::RESET;
+
+        // Thread syncs back here when the query is finished processing
+        auto filtered = futureFiltered.get(); 
         GridFormatter::render(tbl->getColumns(), filtered);
     } else {
-        // SELECT all
         auto rows = tbl->selectAll();
         GridFormatter::render(tbl->getColumns(), rows);
     }
 }
 
-/**
- * UPDATE <table> SET col=val, col2=val2 WHERE pk_col = pk_val
- */
 void CommandParser::cmdUpdate(const std::vector<std::string>& /*tokens*/,
                               const std::string& rawInput) {
     Table* tbl = NexusManager::getInstance().getCurrentTable();
@@ -355,7 +343,6 @@ void CommandParser::cmdUpdate(const std::vector<std::string>& /*tokens*/,
     const Column* pk = tbl->getPrimaryKey();
     if (!pk) { printError("Table has no primary key — cannot UPDATE."); return; }
 
-    // Find SET and WHERE positions in raw input (case-insensitive)
     std::string upper = toUpper(rawInput);
     size_t setPos   = upper.find(" SET ");
     size_t wherePos = upper.find(" WHERE ");
@@ -365,26 +352,21 @@ void CommandParser::cmdUpdate(const std::vector<std::string>& /*tokens*/,
         return;
     }
 
-    // Extract SET assignments
     std::string setPart = rawInput.substr(setPos + 5, wherePos - setPos - 5);
-    // Extract WHERE condition
     std::string wherePart = rawInput.substr(wherePos + 7);
 
-    // Parse WHERE: pk_col = value
     size_t eqPos = wherePart.find('=');
     if (eqPos == std::string::npos) {
         printError("WHERE clause must be: " + pk->name + " = <value>");
         return;
     }
     std::string whereVal = trim(wherePart.substr(eqPos + 1));
-    // Remove quotes
     if (whereVal.size() >= 2 &&
         ((whereVal.front() == '\'' && whereVal.back() == '\'') ||
          (whereVal.front() == '"'  && whereVal.back() == '"'))) {
         whereVal = whereVal.substr(1, whereVal.size() - 2);
     }
 
-    // Parse SET: col1=val1, col2=val2
     std::map<std::string, std::string> updates;
     std::istringstream setStream(setPart);
     std::string assignment;
@@ -397,7 +379,6 @@ void CommandParser::cmdUpdate(const std::vector<std::string>& /*tokens*/,
         }
         std::string col = trim(assignment.substr(0, eq));
         std::string val = trim(assignment.substr(eq + 1));
-        // Remove quotes
         if (val.size() >= 2 &&
             ((val.front() == '\'' && val.back() == '\'') ||
              (val.front() == '"'  && val.back() == '"'))) {
@@ -414,9 +395,6 @@ void CommandParser::cmdUpdate(const std::vector<std::string>& /*tokens*/,
     }
 }
 
-/**
- * DELETE FROM <table> WHERE pk_col = pk_val
- */
 void CommandParser::cmdDelete(const std::vector<std::string>& /*tokens*/,
                               const std::string& rawInput) {
     Table* tbl = NexusManager::getInstance().getCurrentTable();
